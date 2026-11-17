@@ -1,114 +1,33 @@
-const express = require('express');
-const http = require('http');
-const { Server } = require('socket.io');
-const cors = require('cors');
-const jwt = require('jsonwebtoken');
+'use strict';
 
-const app = express();
-app.use(cors());
-app.use(express.json());
+const { createServer } = require('./src/server');
 
-const server = http.createServer(app);
+const REQUIRED_ENV = ['NEXTAUTH_SECRET', 'WSS_DISPATCH_SECRET'];
+const missing = REQUIRED_ENV.filter((name) => !process.env[name]);
+if (missing.length > 0) {
+  console.error(
+    `❌ FATAL: missing required environment variable(s): ${missing.join(', ')}. ` +
+      'See .env.example. Refusing to start.'
+  );
+  process.exit(1);
+}
 
-const io = new Server(server, {
-  cors: {
-    origin: '*',
-    methods: ['GET', 'POST']
-  },
-  // Production-grade settings
-  pingTimeout: 60000,
-  pingInterval: 25000,
-  maxHttpBufferSize: 1e6
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || '')
+  .split(',')
+  .map((o) => o.trim())
+  .filter(Boolean);
+
+if (allowedOrigins.length === 0) {
+  console.warn('⚠️ ALLOWED_ORIGINS is empty: only requests without an Origin header will be accepted.');
+}
+
+const { httpServer } = createServer({
+  jwtSecret: process.env.NEXTAUTH_SECRET,
+  dispatchSecret: process.env.WSS_DISPATCH_SECRET,
+  allowedOrigins,
 });
 
-const JWT_SECRET = process.env.NEXTAUTH_SECRET || 'fallback-secret-for-development';
-
-// Health check endpoint (required by Render)
-app.get('/', (req, res) => {
-  res.json({
-    service: 'FunPrinting WebSocket Cloud Engine',
-    status: 'running',
-    connectedPartners: io.engine.clientsCount,
-    uptime: Math.floor(process.uptime()) + 's'
-  });
-});
-
-app.get('/health', (req, res) => {
-  res.status(200).json({ status: 'ok' });
-});
-
-// Middleware for WebSocket Auth
-io.use((socket, next) => {
-  const token = socket.handshake.auth.token;
-  if (!token) {
-    return next(new Error('Authentication error: No token provided'));
-  }
-
-  try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    if (decoded.role !== 'partner' && decoded.role !== 'admin') {
-      return next(new Error('Authentication error: Invalid role'));
-    }
-    
-    // Store partner info in socket
-    socket.partnerId = decoded.partnerId || decoded.sub;
-    next();
-  } catch (err) {
-    return next(new Error('Authentication error: Invalid token'));
-  }
-});
-
-io.on('connection', (socket) => {
-  console.log(`🟢 Partner connected: ${socket.partnerId} (Socket ID: ${socket.id})`);
-  
-  // Join a room specific to this partner
-  socket.join(`partner_${socket.partnerId}`);
-
-  // Partner updates their hardware status
-  socket.on('hardware_status_update', (data) => {
-    console.log(`🖨️ Hardware update from ${socket.partnerId}:`, data);
-  });
-
-  // Partner ACKs a print job
-  socket.on('print_job_ack', (data) => {
-    console.log(`✅ Job ${data.jobId} ACKed by ${socket.partnerId}`);
-  });
-
-  // Phase 5: Remote Control Forwarding (Mobile App -> PC App)
-  socket.on('remote_control', (data) => {
-    console.log(`📱 Remote control action '${data.action}' from ${socket.partnerId}`);
-    // Forward the command to all other devices in the partner's room (e.g. the PC App)
-    socket.to(`partner_${socket.partnerId}`).emit('remote_control_action', data);
-  });
-
-  socket.on('disconnect', () => {
-    console.log(`🔴 Partner disconnected: ${socket.partnerId}`);
-  });
-});
-
-// HTTP Webhook for the Next.js API to trigger print jobs
-// When Razorpay confirms payment, Next.js calls this endpoint.
-app.post('/api/dispatch-print-job', (req, res) => {
-  const { partnerId, order } = req.body;
-  
-  if (!partnerId || !order) {
-    return res.status(400).json({ error: 'Missing partnerId or order data' });
-  }
-
-  console.log(`🚀 Dispatching print job for Order ${order.orderId} to Partner ${partnerId}`);
-  
-  // Emit exclusively to the partner's room
-  io.to(`partner_${partnerId}`).emit('new_print_job', {
-    jobId: order.orderId,
-    timestamp: Date.now(),
-    documentUrl: order.fileURL || (order.fileURLs ? order.fileURLs[0] : null),
-    options: order.printingOptions
-  });
-
-  res.status(200).json({ success: true, message: 'Print job dispatched to socket room' });
-});
-
-const PORT = process.env.PORT || 3001;
-server.listen(PORT, '0.0.0.0', () => {
+const PORT = Number(process.env.PORT) || 3001;
+httpServer.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 FunPrinting WebSocket Cloud Engine running on port ${PORT}`);
 });
