@@ -48,6 +48,18 @@ function safeEqual(a, b) {
  * then parses the body as JSON into req.body.
  */
 function makeSignatureVerifier(secret, now = () => Date.now()) {
+  // Signatures accepted in the last skew window. A captured request replayed within
+  // the window is rejected, so one payment can't be printed twice by replaying it.
+  const seen = new Map(); // signature -> expiry (ms)
+  const remember = (signature) => {
+    const t = now();
+    for (const [sig, expiry] of seen) {
+      if (expiry > t) break; // insertion order = expiry order
+      seen.delete(sig);
+    }
+    seen.set(signature, t + 2 * MAX_CLOCK_SKEW_MS);
+  };
+
   return (req, res, next) => {
     const timestamp = req.get('x-fp-timestamp');
     const signature = req.get('x-fp-signature');
@@ -67,6 +79,10 @@ function makeSignatureVerifier(secret, now = () => Date.now()) {
     if (!safeEqual(signature, expected)) {
       return res.status(401).json({ error: 'Invalid signature' });
     }
+    if (seen.has(signature)) {
+      return res.status(409).json({ error: 'Replayed request' });
+    }
+    remember(signature);
 
     req.rawBody = rawBody;
     try {
@@ -209,17 +225,28 @@ function createServer({ jwtSecret, dispatchSecret, allowedOrigins = [] } = {}) {
         return res.status(400).json({ error: 'Invalid order file URLs' });
       }
 
+      const stringArray = (v) => (Array.isArray(v) && v.every((x) => typeof x === 'string') ? v : undefined);
+      const fileNames = stringArray(order.originalFileNames);
+      const fileTypes = stringArray(order.fileTypes);
+
+      // Field names match what partner-desktop (src/main/jobProcessor.js) and
+      // partner-mobile (App.js) read: fileURLs / originalFileNames / fileTypes /
+      // originalFileName. documentUrl(s) and fileNames are kept for older clients.
       const payload = {
         jobId: order.orderId,
         orderId: order.orderId,
         timestamp: Date.now(),
         documentUrl: documentUrls[0],
         documentUrls,
+        fileURLs: documentUrls,
         options: order.printingOptions,
       };
-      if (Array.isArray(order.originalFileNames)) {
-        payload.fileNames = order.originalFileNames;
+      if (fileNames) {
+        payload.fileNames = fileNames;
+        payload.originalFileNames = fileNames;
       }
+      if (fileTypes) payload.fileTypes = fileTypes;
+      if (typeof order.originalFileName === 'string') payload.originalFileName = order.originalFileName;
 
       const room = `partner_${partnerId}`;
       const sockets = await io.in(room).fetchSockets();

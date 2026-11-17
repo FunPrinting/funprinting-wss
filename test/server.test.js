@@ -215,6 +215,36 @@ describe('POST /api/dispatch-print-job', () => {
     assert.deepEqual(job.fileNames, validOrder.originalFileNames);
     assert.deepEqual(job.options, validOrder.printingOptions);
     assert.equal(typeof job.timestamp, 'number');
+    // Field names the partner apps read
+    assert.deepEqual(job.fileURLs, validOrder.fileURLs);
+    assert.deepEqual(job.originalFileNames, validOrder.originalFileNames);
+  });
+
+  test('forwards fileTypes and originalFileName; ignores non-string arrays', async () => {
+    const socket = await connect(partnerToken());
+    const received = waitFor(socket, 'new_print_job');
+    await post('/api/dispatch-print-job', {
+      partnerId: PARTNER_ID,
+      order: { ...validOrder, orderId: 'ORD-TYPES', fileTypes: ['pdf', 'docx'], originalFileName: 'a.pdf', originalFileNames: [1, 2] },
+    });
+    const job = await received;
+    assert.deepEqual(job.fileTypes, ['pdf', 'docx']);
+    assert.equal(job.originalFileName, 'a.pdf');
+    assert.equal(job.originalFileNames, undefined);
+  });
+
+  test('replaying the exact signed request -> 409, job not emitted twice', async () => {
+    const socket = await connect(partnerToken());
+    let count = 0;
+    socket.on('new_print_job', () => { count += 1; });
+    const body = { partnerId: PARTNER_ID, order: { ...validOrder, orderId: 'ORD-REPLAY' } };
+    const timestamp = String(Date.now());
+    const first = await post('/api/dispatch-print-job', body, { timestamp });
+    const replay = await post('/api/dispatch-print-job', body, { timestamp });
+    assert.equal(first.status, 200);
+    assert.equal(replay.status, 409);
+    await new Promise((r) => setTimeout(r, 100));
+    assert.equal(count, 1);
   });
 
   test('single fileURL is wrapped into documentUrls', async () => {
