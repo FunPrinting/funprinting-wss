@@ -1,6 +1,7 @@
 'use strict';
 
 const { createServer } = require('./src/server');
+const { createErrorReporter } = require('./src/errorReporter');
 
 const REQUIRED_ENV = ['NEXTAUTH_SECRET', 'WSS_DISPATCH_SECRET'];
 const missing = REQUIRED_ENV.filter((name) => !process.env[name]);
@@ -10,6 +11,16 @@ if (missing.length > 0) {
       'See .env.example. Refusing to start.'
   );
   process.exit(1);
+}
+
+// Errors and warnings go to the web app's error tracking (/admin/errors)
+const reporter = createErrorReporter({
+  webApiUrl: process.env.WEB_API_URL,
+  secret: process.env.WSS_DISPATCH_SECRET,
+  release: (process.env.RENDER_GIT_COMMIT || '').slice(0, 12) || undefined,
+});
+if (!reporter.install()) {
+  console.log('ℹ️ WEB_API_URL not set: errors are logged but not sent to error tracking.');
 }
 
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || '')
