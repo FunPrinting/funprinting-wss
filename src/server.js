@@ -97,7 +97,7 @@ function makeSignatureVerifier(secret, now = () => Date.now()) {
   };
 }
 
-function createServer({ jwtSecret, dispatchSecret, allowedOrigins = [] } = {}) {
+function createServer({ jwtSecret, dispatchSecret, partnerJwtSecret, allowedOrigins = [] } = {}) {
   if (!jwtSecret) throw new Error('createServer: jwtSecret is required');
   if (!dispatchSecret) throw new Error('createServer: dispatchSecret is required');
 
@@ -147,10 +147,24 @@ function createServer({ jwtSecret, dispatchSecret, allowedOrigins = [] } = {}) {
       return next(new Error('Authentication error: No token provided'));
     }
 
+    // Device sign-in access tokens (typ partner_access, 15 min) use PARTNER_JWT_SECRET;
+    // tokens from apps installed before device sign-in use NEXTAUTH_SECRET.
+    let typ;
+    try {
+      typ = (jwt.decode(token) || {}).typ;
+    } catch {
+      typ = undefined;
+    }
+    const isAccess = typ === 'partner_access';
+    if (isAccess && !partnerJwtSecret) return next(new Error('Authentication error: Invalid token'));
+
     let decoded;
     try {
-      decoded = jwt.verify(token, jwtSecret, { algorithms: ['HS256'] });
+      decoded = jwt.verify(token, isAccess ? partnerJwtSecret : jwtSecret, { algorithms: ['HS256'] });
     } catch {
+      return next(new Error('Authentication error: Invalid token'));
+    }
+    if (isAccess && (typeof decoded.did !== 'string' || !decoded.did)) {
       return next(new Error('Authentication error: Invalid token'));
     }
 
@@ -164,6 +178,12 @@ function createServer({ jwtSecret, dispatchSecret, allowedOrigins = [] } = {}) {
     }
 
     socket.partnerId = partnerId;
+    socket.deviceId = isAccess ? decoded.did : undefined;
+    // An access token expires after 15 minutes; drop the socket then, so a revoked
+    // device can't stay connected. The app reconnects with a refreshed token.
+    if (isAccess && typeof decoded.exp === 'number') {
+      socket.tokenExpiresAt = decoded.exp * 1000;
+    }
     next();
   });
 
@@ -171,6 +191,12 @@ function createServer({ jwtSecret, dispatchSecret, allowedOrigins = [] } = {}) {
     const room = `partner_${socket.partnerId}`;
     console.log(`🟢 Partner connected: ${socket.partnerId} (Socket ID: ${socket.id})`);
     socket.join(room);
+    if (socket.deviceId) socket.join(`device_${socket.deviceId}`);
+    if (socket.tokenExpiresAt) {
+      const ms = Math.max(0, socket.tokenExpiresAt - Date.now());
+      const timer = setTimeout(() => socket.disconnect(true), Math.min(ms, 2 ** 31 - 1));
+      socket.on('disconnect', () => clearTimeout(timer));
+    }
 
     socket.on('hardware_status_update', () => {
       console.log(`🖨️ Hardware update from ${socket.partnerId}`);
@@ -274,6 +300,25 @@ function createServer({ jwtSecret, dispatchSecret, allowedOrigins = [] } = {}) {
       const sockets = await io.in(room).fetchSockets();
       io.to(room).emit('jobs:available', { reason: safeReason, at: Date.now() });
       res.status(200).json({ success: true, delivered: sockets.length });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // A partner device was signed out: close its sockets now
+  app.post('/api/disconnect-device', signedJson, async (req, res, next) => {
+    try {
+      const { partnerId, deviceId } = req.body;
+      if (!isNonEmptyString(partnerId) || !OBJECT_ID_RE.test(partnerId) || !isNonEmptyString(deviceId) || deviceId.length > 64) {
+        return res.status(400).json({ error: 'Invalid body' });
+      }
+      const sockets = await io.in(`device_${deviceId}`).fetchSockets();
+      const own = sockets.filter((sk) => sk.partnerId === partnerId);
+      for (const sk of own) {
+        sk.emit('signed_out', { reason: 'device_revoked' });
+        sk.disconnect(true);
+      }
+      res.status(200).json({ success: true, delivered: own.length });
     } catch (err) {
       next(err);
     }

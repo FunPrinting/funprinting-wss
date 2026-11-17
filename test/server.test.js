@@ -31,6 +31,10 @@ async function post(path, body, opts = {}) {
   return { status: res.status, body: await res.json() };
 }
 
+const PARTNER_JWT_SECRET = 'p'.repeat(40);
+function accessToken(claims = {}, opts = { expiresIn: 900 }) {
+  return jwt.sign({ sub: 'u1', partnerId: PARTNER_ID, did: 'dev_abc123', role: 'partner', typ: 'partner_access', ...claims }, PARTNER_JWT_SECRET, opts);
+}
 function partnerToken(claims = {}) {
   return jwt.sign({ sub: PARTNER_ID, partnerId: PARTNER_ID, role: 'partner', ...claims }, JWT_SECRET);
 }
@@ -80,6 +84,7 @@ const validOrder = {
 
 before(async () => {
   server = createServer({
+    partnerJwtSecret: PARTNER_JWT_SECRET,
     jwtSecret: JWT_SECRET,
     dispatchSecret: DISPATCH_SECRET,
     allowedOrigins: [ALLOWED_ORIGIN],
@@ -285,6 +290,39 @@ describe('POST /api/notify-jobs', () => {
     assert.equal((await received).reason, 'updated');
     assert.equal((await post('/api/notify-jobs', { partnerId: PARTNER_ID }, { signatureHeader: 'bad' })).status, 401);
     assert.equal((await post('/api/notify-jobs', { partnerId: 'nope' })).status, 400);
+  });
+});
+
+describe('device sign-in tokens', () => {
+  test('access token with the partner secret connects and joins the partner room', async () => {
+    const socket = await connect(accessToken());
+    const received = waitFor(socket, 'jobs:available');
+    await post('/api/notify-jobs', { partnerId: PARTNER_ID, reason: 'new' });
+    assert.equal((await received).reason, 'new');
+  });
+
+  test('access token signed with the legacy secret, or without a device id, is rejected', async () => {
+    const forged = jwt.sign({ sub: 'u1', partnerId: PARTNER_ID, did: 'dev_x', role: 'partner', typ: 'partner_access' }, JWT_SECRET);
+    await assert.rejects(connect(forged), /Invalid token/);
+    await assert.rejects(connect(accessToken({ did: undefined })), /Invalid token/);
+  });
+
+  test('disconnect-device signs out only that device', async () => {
+    const target = await connect(accessToken());
+    const other = await connect(accessToken({ did: 'dev_other1' }));
+    const signedOut = waitFor(target, 'signed_out');
+    const res = await post('/api/disconnect-device', { partnerId: PARTNER_ID, deviceId: 'dev_abc123' });
+    assert.deepEqual(res.body, { success: true, delivered: 1 });
+    assert.equal((await signedOut).reason, 'device_revoked');
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(target.connected, false);
+    assert.equal(other.connected, true);
+  });
+
+  test('socket closes when the access token expires', async () => {
+    const socket = await connect(accessToken({}, { expiresIn: 1 }));
+    await new Promise((r) => socket.once('disconnect', r));
+    assert.equal(socket.connected, false);
   });
 });
 

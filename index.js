@@ -19,6 +19,9 @@ const reporter = createErrorReporter({
   secret: process.env.WSS_DISPATCH_SECRET,
   release: (process.env.RENDER_GIT_COMMIT || '').slice(0, 12) || undefined,
 });
+if (!process.env.PARTNER_JWT_SECRET) {
+  console.warn('⚠️ PARTNER_JWT_SECRET is not set: only legacy partner tokens are accepted.');
+}
 if (!reporter.install()) {
   console.log('ℹ️ WEB_API_URL not set: errors are logged but not sent to error tracking.');
 }
@@ -35,6 +38,8 @@ if (allowedOrigins.length === 0) {
 const { httpServer } = createServer({
   jwtSecret: process.env.NEXTAUTH_SECRET,
   dispatchSecret: process.env.WSS_DISPATCH_SECRET,
+  // Device sign-in access tokens; must match the web app's PARTNER_JWT_SECRET
+  partnerJwtSecret: process.env.PARTNER_JWT_SECRET,
   allowedOrigins,
 });
 
