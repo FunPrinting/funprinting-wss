@@ -266,6 +266,28 @@ describe('POST /api/dispatch-print-job', () => {
   });
 });
 
+describe('POST /api/notify-jobs', () => {
+  test('emits jobs:available to the partner room only', async () => {
+    const socket = await connect(partnerToken());
+    const received = waitFor(socket, 'jobs:available');
+    const res = await post('/api/notify-jobs', { partnerId: PARTNER_ID, reason: 'new' });
+    assert.equal(res.status, 200);
+    assert.deepEqual(res.body, { success: true, delivered: 1 });
+    const msg = await received;
+    assert.equal(msg.reason, 'new');
+    assert.equal(typeof msg.at, 'number');
+  });
+
+  test('unknown reason becomes updated; signature and partnerId are required', async () => {
+    const socket = await connect(partnerToken());
+    const received = waitFor(socket, 'jobs:available');
+    await post('/api/notify-jobs', { partnerId: PARTNER_ID, reason: '<script>' });
+    assert.equal((await received).reason, 'updated');
+    assert.equal((await post('/api/notify-jobs', { partnerId: PARTNER_ID }, { signatureHeader: 'bad' })).status, 401);
+    assert.equal((await post('/api/notify-jobs', { partnerId: 'nope' })).status, 400);
+  });
+});
+
 describe('POST /api/cancel-print-job', () => {
   test('emits cancel_print_job with jobId', async () => {
     const socket = await connect(partnerToken());
