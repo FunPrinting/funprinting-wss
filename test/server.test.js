@@ -269,6 +269,17 @@ describe('POST /api/dispatch-print-job', () => {
     assert.equal(res.body.delivered, 0);
     await none;
   });
+
+  test('device sign-in sockets are not pushed jobs and not counted', async () => {
+    const device = await connect(accessToken({ did: 'dev_push01' }));
+    const legacy = await connect(partnerToken());
+    const none = expectNoEvent(device, 'new_print_job');
+    const received = waitFor(legacy, 'new_print_job');
+    const res = await post('/api/dispatch-print-job', { partnerId: PARTNER_ID, order: { ...validOrder, orderId: 'ORD-PULL' } });
+    assert.equal(res.body.delivered, 1);
+    await received;
+    await none;
+  });
 });
 
 describe('POST /api/notify-jobs', () => {
