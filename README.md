@@ -15,6 +15,7 @@ npm test               # node --test
 | --- | --- | --- |
 | `NEXTAUTH_SECRET` | yes | HS256 secret for verifying partner socket JWTs. Must match the web app. |
 | `WSS_DISPATCH_SECRET` | yes | Shared secret for signing dispatch/cancel HTTP requests. |
+| `WEB_API_URL` | no | Web app base URL. Errors and warnings are sent, signed, to `${WEB_API_URL}/api/errors` and show up in `/admin/errors`. Unset: log only. |
 | `ALLOWED_ORIGINS` | no | Comma-separated browser origins allowed by CORS and Socket.IO. Requests without an `Origin` header are always allowed. |
 | `PORT` | no | Listen port (default `3001`). |
 
