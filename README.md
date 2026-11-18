@@ -30,6 +30,10 @@ Events:
 - Server → client `cancel_print_job`: `{ jobId }`.
 - Client → server `remote_control`: `{ action: 'pause' | 'resume' }`. Forwarded to other sockets in the room as `remote_control_action`. Any other action is ignored.
 
+## Job notifications
+
+`POST /api/notify-jobs` `{ partnerId, reason: new|updated|cancelled }` (signed) emits `jobs:available` `{ reason, at }` to `partner_<partnerId>`. It carries no job data: devices then fetch `GET /api/partner/v1/jobs` from the web app. The older `new_print_job` / `cancel_print_job` pushes are kept for installed apps.
+
 ## Signed HTTP requests
 
 `POST /api/dispatch-print-job` with body `{ partnerId, order }`, and `POST /api/cancel-print-job` with body `{ partnerId, orderId }`, must carry two headers:

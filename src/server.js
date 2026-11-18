@@ -261,6 +261,24 @@ function createServer({ jwtSecret, dispatchSecret, allowedOrigins = [] } = {}) {
     }
   });
 
+  // Job list changed for a partner: devices re-fetch /api/partner/v1/jobs.
+  // Carries no job data; the API is the source of truth.
+  app.post('/api/notify-jobs', signedJson, async (req, res, next) => {
+    try {
+      const { partnerId, reason } = req.body;
+      if (!isNonEmptyString(partnerId) || !OBJECT_ID_RE.test(partnerId)) {
+        return res.status(400).json({ error: 'Invalid partnerId' });
+      }
+      const safeReason = ['new', 'updated', 'cancelled'].includes(reason) ? reason : 'updated';
+      const room = `partner_${partnerId}`;
+      const sockets = await io.in(room).fetchSockets();
+      io.to(room).emit('jobs:available', { reason: safeReason, at: Date.now() });
+      res.status(200).json({ success: true, delivered: sockets.length });
+    } catch (err) {
+      next(err);
+    }
+  });
+
   app.post('/api/cancel-print-job', signedJson, async (req, res, next) => {
     try {
       const { partnerId, orderId } = req.body;
