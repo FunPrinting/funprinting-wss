@@ -179,6 +179,10 @@ function createServer({ jwtSecret, dispatchSecret, partnerJwtSecret, allowedOrig
 
     socket.partnerId = partnerId;
     socket.deviceId = isAccess ? decoded.did : undefined;
+    // socket.data survives fetchSockets() with any adapter (plain properties only
+    // survive with the in-memory adapter)
+    socket.data.partnerId = partnerId;
+    socket.data.deviceId = socket.deviceId;
     // An access token expires after 15 minutes; drop the socket then, so a revoked
     // device can't stay connected. The app reconnects with a refreshed token.
     if (isAccess && typeof decoded.exp === 'number') {
@@ -274,14 +278,18 @@ function createServer({ jwtSecret, dispatchSecret, partnerJwtSecret, allowedOrig
       if (fileTypes) payload.fileTypes = fileTypes;
       if (typeof order.originalFileName === 'string') payload.originalFileName = order.originalFileName;
 
+      // Only apps on a legacy token get the job pushed. Apps with device sign-in
+      // pull jobs from /api/partner/v1/jobs (they are told via jobs:available), so
+      // they are not counted: a push to them is not a claim.
       const room = `partner_${partnerId}`;
       const sockets = await io.in(room).fetchSockets();
-      io.to(room).emit('new_print_job', payload);
+      const legacy = sockets.filter((sk) => !sk.data.deviceId);
+      for (const sk of legacy) sk.emit('new_print_job', payload);
 
       console.log(
-        `🚀 Dispatched order ${order.orderId} to partner ${partnerId} (${sockets.length} socket(s))`
+        `🚀 Dispatched order ${order.orderId} to partner ${partnerId} (${legacy.length} legacy socket(s) of ${sockets.length})`
       );
-      res.status(200).json({ success: true, delivered: sockets.length });
+      res.status(200).json({ success: true, delivered: legacy.length });
     } catch (err) {
       next(err);
     }
@@ -313,7 +321,7 @@ function createServer({ jwtSecret, dispatchSecret, partnerJwtSecret, allowedOrig
         return res.status(400).json({ error: 'Invalid body' });
       }
       const sockets = await io.in(`device_${deviceId}`).fetchSockets();
-      const own = sockets.filter((sk) => sk.partnerId === partnerId);
+      const own = sockets.filter((sk) => sk.data.partnerId === partnerId);
       for (const sk of own) {
         sk.emit('signed_out', { reason: 'device_revoked' });
         sk.disconnect(true);
