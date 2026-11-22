@@ -97,8 +97,8 @@ function makeSignatureVerifier(secret, now = () => Date.now()) {
   };
 }
 
-function createServer({ jwtSecret, dispatchSecret, partnerJwtSecret, allowedOrigins = [] } = {}) {
-  if (!jwtSecret) throw new Error('createServer: jwtSecret is required');
+function createServer({ dispatchSecret, partnerJwtSecret, allowedOrigins = [] } = {}) {
+  if (!partnerJwtSecret) throw new Error('createServer: partnerJwtSecret is required');
   if (!dispatchSecret) throw new Error('createServer: dispatchSecret is required');
 
   const isOriginAllowed = makeOriginChecker(allowedOrigins);
@@ -147,24 +147,25 @@ function createServer({ jwtSecret, dispatchSecret, partnerJwtSecret, allowedOrig
       return next(new Error('Authentication error: No token provided'));
     }
 
-    // Device sign-in access tokens (typ partner_access, 15 min) use PARTNER_JWT_SECRET;
-    // tokens from apps installed before device sign-in use NEXTAUTH_SECRET.
-    let typ;
+    // Only device sign-in access tokens (typ partner_access, 15 min, PARTNER_JWT_SECRET)
+    // connect. Apps from before device sign-in must update and sign in again.
+    let claims;
     try {
-      typ = (jwt.decode(token) || {}).typ;
+      claims = jwt.decode(token);
     } catch {
-      typ = undefined;
+      claims = null;
     }
-    const isAccess = typ === 'partner_access';
-    if (isAccess && !partnerJwtSecret) return next(new Error('Authentication error: Invalid token'));
+    if (!claims || typeof claims !== 'object') return next(new Error('Authentication error: Invalid token'));
+    // A readable token without the access type is from an app that predates device sign-in
+    if (claims.typ !== 'partner_access') return next(new Error('Authentication error: upgrade_required'));
 
     let decoded;
     try {
-      decoded = jwt.verify(token, isAccess ? partnerJwtSecret : jwtSecret, { algorithms: ['HS256'] });
+      decoded = jwt.verify(token, partnerJwtSecret, { algorithms: ['HS256'] });
     } catch {
       return next(new Error('Authentication error: Invalid token'));
     }
-    if (isAccess && (typeof decoded.did !== 'string' || !decoded.did)) {
+    if ((typeof decoded.did !== 'string' || !decoded.did)) {
       return next(new Error('Authentication error: Invalid token'));
     }
 
@@ -178,14 +179,14 @@ function createServer({ jwtSecret, dispatchSecret, partnerJwtSecret, allowedOrig
     }
 
     socket.partnerId = partnerId;
-    socket.deviceId = isAccess ? decoded.did : undefined;
+    socket.deviceId = decoded.did;
     // socket.data survives fetchSockets() with any adapter (plain properties only
     // survive with the in-memory adapter)
     socket.data.partnerId = partnerId;
     socket.data.deviceId = socket.deviceId;
     // An access token expires after 15 minutes; drop the socket then, so a revoked
     // device can't stay connected. The app reconnects with a refreshed token.
-    if (isAccess && typeof decoded.exp === 'number') {
+    if (typeof decoded.exp === 'number') {
       socket.tokenExpiresAt = decoded.exp * 1000;
     }
     next();
@@ -232,69 +233,6 @@ function createServer({ jwtSecret, dispatchSecret, partnerJwtSecret, allowedOrig
     makeSignatureVerifier(dispatchSecret),
   ];
 
-  // Called by the web app after payment confirmation.
-  app.post('/api/dispatch-print-job', signedJson, async (req, res, next) => {
-    try {
-      const { partnerId, order } = req.body;
-
-      if (!isNonEmptyString(partnerId) || !OBJECT_ID_RE.test(partnerId)) {
-        return res.status(400).json({ error: 'Invalid partnerId' });
-      }
-      if (!order || typeof order !== 'object' || Array.isArray(order)) {
-        return res.status(400).json({ error: 'Missing order data' });
-      }
-      if (!isNonEmptyString(order.orderId)) {
-        return res.status(400).json({ error: 'Invalid order.orderId' });
-      }
-
-      const documentUrls =
-        Array.isArray(order.fileURLs) && order.fileURLs.length > 0
-          ? order.fileURLs
-          : [order.fileURL];
-      if (!documentUrls.every(isNonEmptyString)) {
-        return res.status(400).json({ error: 'Invalid order file URLs' });
-      }
-
-      const stringArray = (v) => (Array.isArray(v) && v.every((x) => typeof x === 'string') ? v : undefined);
-      const fileNames = stringArray(order.originalFileNames);
-      const fileTypes = stringArray(order.fileTypes);
-
-      // Field names match what partner-desktop (src/main/jobProcessor.js) and
-      // partner-mobile (App.js) read: fileURLs / originalFileNames / fileTypes /
-      // originalFileName. documentUrl(s) and fileNames are kept for older clients.
-      const payload = {
-        jobId: order.orderId,
-        orderId: order.orderId,
-        timestamp: Date.now(),
-        documentUrl: documentUrls[0],
-        documentUrls,
-        fileURLs: documentUrls,
-        options: order.printingOptions,
-      };
-      if (fileNames) {
-        payload.fileNames = fileNames;
-        payload.originalFileNames = fileNames;
-      }
-      if (fileTypes) payload.fileTypes = fileTypes;
-      if (typeof order.originalFileName === 'string') payload.originalFileName = order.originalFileName;
-
-      // Only apps on a legacy token get the job pushed. Apps with device sign-in
-      // pull jobs from /api/partner/v1/jobs (they are told via jobs:available), so
-      // they are not counted: a push to them is not a claim.
-      const room = `partner_${partnerId}`;
-      const sockets = await io.in(room).fetchSockets();
-      const legacy = sockets.filter((sk) => !sk.data.deviceId);
-      for (const sk of legacy) sk.emit('new_print_job', payload);
-
-      console.log(
-        `🚀 Dispatched order ${order.orderId} to partner ${partnerId} (${legacy.length} legacy socket(s) of ${sockets.length})`
-      );
-      res.status(200).json({ success: true, delivered: legacy.length });
-    } catch (err) {
-      next(err);
-    }
-  });
-
   // Job list changed for a partner: devices re-fetch /api/partner/v1/jobs.
   // Carries no job data; the API is the source of truth.
   app.post('/api/notify-jobs', signedJson, async (req, res, next) => {
@@ -327,28 +265,6 @@ function createServer({ jwtSecret, dispatchSecret, partnerJwtSecret, allowedOrig
         sk.disconnect(true);
       }
       res.status(200).json({ success: true, delivered: own.length });
-    } catch (err) {
-      next(err);
-    }
-  });
-
-  app.post('/api/cancel-print-job', signedJson, async (req, res, next) => {
-    try {
-      const { partnerId, orderId } = req.body;
-
-      if (!isNonEmptyString(partnerId) || !OBJECT_ID_RE.test(partnerId)) {
-        return res.status(400).json({ error: 'Invalid partnerId' });
-      }
-      if (!isNonEmptyString(orderId)) {
-        return res.status(400).json({ error: 'Invalid orderId' });
-      }
-
-      const room = `partner_${partnerId}`;
-      const sockets = await io.in(room).fetchSockets();
-      io.to(room).emit('cancel_print_job', { jobId: orderId });
-
-      console.log(`🛑 Cancelled order ${orderId} for partner ${partnerId} (${sockets.length} socket(s))`);
-      res.status(200).json({ success: true, delivered: sockets.length });
     } catch (err) {
       next(err);
     }

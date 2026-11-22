@@ -3,7 +3,7 @@
 const { createServer } = require('./src/server');
 const { createErrorReporter } = require('./src/errorReporter');
 
-const REQUIRED_ENV = ['NEXTAUTH_SECRET', 'WSS_DISPATCH_SECRET'];
+const REQUIRED_ENV = ['PARTNER_JWT_SECRET', 'WSS_DISPATCH_SECRET'];
 const missing = REQUIRED_ENV.filter((name) => !process.env[name]);
 if (missing.length > 0) {
   console.error(
@@ -36,9 +36,8 @@ if (allowedOrigins.length === 0) {
 }
 
 const { httpServer } = createServer({
-  jwtSecret: process.env.NEXTAUTH_SECRET,
   dispatchSecret: process.env.WSS_DISPATCH_SECRET,
-  // Device sign-in access tokens; must match the web app's PARTNER_JWT_SECRET
+  // Device sign-in access tokens: must match the web app's PARTNER_JWT_SECRET
   partnerJwtSecret: process.env.PARTNER_JWT_SECRET,
   allowedOrigins,
 });

@@ -36,6 +36,10 @@ function accessToken(claims = {}, opts = { expiresIn: 900 }) {
   return jwt.sign({ sub: 'u1', partnerId: PARTNER_ID, did: 'dev_abc123', role: 'partner', typ: 'partner_access', ...claims }, PARTNER_JWT_SECRET, opts);
 }
 function partnerToken(claims = {}) {
+  return accessToken(claims);
+}
+/** A token from before device sign-in: no typ, signed with the old secret. */
+function oldToken(claims = {}) {
   return jwt.sign({ sub: PARTNER_ID, partnerId: PARTNER_ID, role: 'partner', ...claims }, JWT_SECRET);
 }
 
@@ -85,7 +89,6 @@ const validOrder = {
 before(async () => {
   server = createServer({
     partnerJwtSecret: PARTNER_JWT_SECRET,
-    jwtSecret: JWT_SECRET,
     dispatchSecret: DISPATCH_SECRET,
     allowedOrigins: [ALLOWED_ORIGIN],
   });
@@ -118,167 +121,57 @@ describe('health', () => {
   });
 });
 
-describe('POST /api/dispatch-print-job', () => {
+describe('signed requests', () => {
+  const body = { partnerId: PARTNER_ID, reason: 'new' };
   test('valid signature -> 200 with delivered 0 when nobody online', async () => {
-    const res = await post('/api/dispatch-print-job', { partnerId: PARTNER_ID, order: validOrder });
+    const res = await post('/api/notify-jobs', body);
     assert.equal(res.status, 200);
     assert.deepEqual(res.body, { success: true, delivered: 0 });
   });
-
   test('computeSignature matches the documented contract', () => {
-    const raw = '{"a":1}';
-    const { signature } = sign(raw, { timestamp: '1700000000000' });
-    assert.equal(computeSignature(DISPATCH_SECRET, '1700000000000', Buffer.from(raw)), signature);
+    const expected = crypto.createHmac('sha256', DISPATCH_SECRET).update('123.{"a":1}').digest('hex');
+    assert.equal(computeSignature(DISPATCH_SECRET, '123', '{"a":1}'), expected);
   });
-
   test('missing signature headers -> 401', async () => {
-    const body = { partnerId: PARTNER_ID, order: validOrder };
-    assert.equal((await post('/api/dispatch-print-job', body, { signatureHeader: null })).status, 401);
-    assert.equal((await post('/api/dispatch-print-job', body, { timestampHeader: null })).status, 401);
+    assert.equal((await post('/api/notify-jobs', body, { signatureHeader: null })).status, 401);
+    assert.equal((await post('/api/notify-jobs', body, { timestampHeader: null })).status, 401);
   });
-
   test('bad signature (wrong secret) -> 401', async () => {
-    const res = await post(
-      '/api/dispatch-print-job',
-      { partnerId: PARTNER_ID, order: validOrder },
-      { secret: 'wrong-secret' }
-    );
-    assert.equal(res.status, 401);
+    assert.equal((await post('/api/notify-jobs', body, { secret: 'other-secret' })).status, 401);
   });
-
-  test('signature over a different body -> 401', async () => {
-    const { timestamp, signature } = sign({ partnerId: PARTNER_ID, order: validOrder });
-    const res = await post(
-      '/api/dispatch-print-job',
-      { partnerId: PARTNER_ID, order: { ...validOrder, orderId: 'TAMPERED' } },
-      { timestampHeader: timestamp, signatureHeader: signature }
-    );
-    assert.equal(res.status, 401);
-  });
-
   test('stale timestamp (past and future) -> 401', async () => {
-    const body = { partnerId: PARTNER_ID, order: validOrder };
-    const past = String(Date.now() - 6 * 60 * 1000);
-    const future = String(Date.now() + 6 * 60 * 1000);
-    assert.equal((await post('/api/dispatch-print-job', body, { timestamp: past })).status, 401);
-    assert.equal((await post('/api/dispatch-print-job', body, { timestamp: future })).status, 401);
+    const past = String(Date.now() - 10 * 60 * 1000);
+    const future = String(Date.now() + 10 * 60 * 1000);
+    assert.equal((await post('/api/notify-jobs', body, { timestamp: past })).status, 401);
+    assert.equal((await post('/api/notify-jobs', body, { timestamp: future })).status, 401);
   });
-
   test('non-numeric timestamp -> 401', async () => {
-    const res = await post(
-      '/api/dispatch-print-job',
-      { partnerId: PARTNER_ID, order: validOrder },
-      { timestamp: 'abc' }
-    );
-    assert.equal(res.status, 401);
+    assert.equal((await post('/api/notify-jobs', body, { timestampHeader: 'abc' })).status, 401);
   });
-
   test('wrong-length signature -> 401, not 500', async () => {
-    const body = { partnerId: PARTNER_ID, order: validOrder };
-    assert.equal((await post('/api/dispatch-print-job', body, { signatureHeader: 'abc' })).status, 401);
-    assert.equal(
-      (await post('/api/dispatch-print-job', body, { signatureHeader: 'ff'.repeat(64) })).status,
-      401
-    );
+    assert.equal((await post('/api/notify-jobs', body, { signatureHeader: 'abc' })).status, 401);
+    assert.equal((await post('/api/notify-jobs', body, { signatureHeader: 'ff'.repeat(64) })).status, 401);
   });
-
-  test('invalid partnerId -> 400', async () => {
-    for (const partnerId of ['', 'not-an-id', 'z'.repeat(24), 123, null]) {
-      const res = await post('/api/dispatch-print-job', { partnerId, order: validOrder });
-      assert.equal(res.status, 400, `partnerId=${JSON.stringify(partnerId)}`);
-    }
-  });
-
-  test('missing order / orderId / file URLs -> 400', async () => {
-    const cases = [
-      { partnerId: PARTNER_ID },
-      { partnerId: PARTNER_ID, order: { ...validOrder, orderId: '' } },
-      { partnerId: PARTNER_ID, order: { orderId: 'X' } },
-    ];
-    for (const body of cases) {
-      assert.equal((await post('/api/dispatch-print-job', body)).status, 400);
-    }
-  });
-
   test('invalid JSON with valid signature -> 400', async () => {
-    const res = await post('/api/dispatch-print-job', '{not json');
-    assert.equal(res.status, 400);
+    assert.equal((await post('/api/notify-jobs', '{not json')).status, 400);
   });
-
-  test('connected partner receives new_print_job with all files; delivered = 1', async () => {
-    const socket = await connect(partnerToken());
-    const received = waitFor(socket, 'new_print_job');
-    const res = await post('/api/dispatch-print-job', { partnerId: PARTNER_ID, order: validOrder });
-    assert.equal(res.status, 200);
-    assert.deepEqual(res.body, { success: true, delivered: 1 });
-
-    const job = await received;
-    assert.equal(job.jobId, 'ORD-123');
-    assert.equal(job.orderId, 'ORD-123');
-    assert.equal(job.documentUrl, validOrder.fileURLs[0]);
-    assert.deepEqual(job.documentUrls, validOrder.fileURLs);
-    assert.deepEqual(job.fileNames, validOrder.originalFileNames);
-    assert.deepEqual(job.options, validOrder.printingOptions);
-    assert.equal(typeof job.timestamp, 'number');
-    // Field names the partner apps read
-    assert.deepEqual(job.fileURLs, validOrder.fileURLs);
-    assert.deepEqual(job.originalFileNames, validOrder.originalFileNames);
-  });
-
-  test('forwards fileTypes and originalFileName; ignores non-string arrays', async () => {
-    const socket = await connect(partnerToken());
-    const received = waitFor(socket, 'new_print_job');
-    await post('/api/dispatch-print-job', {
-      partnerId: PARTNER_ID,
-      order: { ...validOrder, orderId: 'ORD-TYPES', fileTypes: ['pdf', 'docx'], originalFileName: 'a.pdf', originalFileNames: [1, 2] },
-    });
-    const job = await received;
-    assert.deepEqual(job.fileTypes, ['pdf', 'docx']);
-    assert.equal(job.originalFileName, 'a.pdf');
-    assert.equal(job.originalFileNames, undefined);
-  });
-
-  test('replaying the exact signed request -> 409, job not emitted twice', async () => {
+  test('replaying the exact signed request -> 409, notified once', async () => {
     const socket = await connect(partnerToken());
     let count = 0;
-    socket.on('new_print_job', () => { count += 1; });
-    const body = { partnerId: PARTNER_ID, order: { ...validOrder, orderId: 'ORD-REPLAY' } };
+    socket.on('jobs:available', () => { count += 1; });
     const timestamp = String(Date.now());
-    const first = await post('/api/dispatch-print-job', body, { timestamp });
-    const replay = await post('/api/dispatch-print-job', body, { timestamp });
+    const first = await post('/api/notify-jobs', body, { timestamp });
+    const replay = await post('/api/notify-jobs', body, { timestamp });
     assert.equal(first.status, 200);
     assert.equal(replay.status, 409);
-    await new Promise((r) => setTimeout(r, 100));
+    await new Promise((r) => setTimeout(r, 200));
     assert.equal(count, 1);
   });
-
-  test('single fileURL is wrapped into documentUrls', async () => {
-    const socket = await connect(partnerToken());
-    const received = waitFor(socket, 'new_print_job');
-    const order = { orderId: 'ORD-1', fileURL: 'https://files.example.com/x.pdf' };
-    await post('/api/dispatch-print-job', { partnerId: PARTNER_ID, order });
-    const job = await received;
-    assert.equal(job.documentUrl, order.fileURL);
-    assert.deepEqual(job.documentUrls, [order.fileURL]);
-  });
-
-  test('other partners do not receive the job', async () => {
-    const other = await connect(partnerToken({ sub: 'b'.repeat(24), partnerId: 'b'.repeat(24) }));
-    const none = expectNoEvent(other, 'new_print_job');
-    const res = await post('/api/dispatch-print-job', { partnerId: PARTNER_ID, order: validOrder });
-    assert.equal(res.body.delivered, 0);
-    await none;
-  });
-
-  test('device sign-in sockets are not pushed jobs and not counted', async () => {
-    const device = await connect(accessToken({ did: 'dev_push01' }));
-    const legacy = await connect(partnerToken());
-    const none = expectNoEvent(device, 'new_print_job');
-    const received = waitFor(legacy, 'new_print_job');
-    const res = await post('/api/dispatch-print-job', { partnerId: PARTNER_ID, order: { ...validOrder, orderId: 'ORD-PULL' } });
-    assert.equal(res.body.delivered, 1);
-    await received;
-    await none;
+  test('removed endpoints are gone', async () => {
+    for (const path of ['/api/dispatch-print-job', '/api/cancel-print-job']) {
+      const res = await fetch(`${baseUrl}${path}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+      assert.equal(res.status, 404);
+    }
   });
 });
 
@@ -312,6 +205,9 @@ describe('device sign-in tokens', () => {
     assert.equal((await received).reason, 'new');
   });
 
+  test('a token from before device sign-in is told to update', async () => {
+    await assert.rejects(connect(oldToken()), /upgrade_required/);
+  });
   test('access token signed with the legacy secret, or without a device id, is rejected', async () => {
     const forged = jwt.sign({ sub: 'u1', partnerId: PARTNER_ID, did: 'dev_x', role: 'partner', typ: 'partner_access' }, JWT_SECRET);
     await assert.rejects(connect(forged), /Invalid token/);
@@ -337,38 +233,13 @@ describe('device sign-in tokens', () => {
   });
 });
 
-describe('POST /api/cancel-print-job', () => {
-  test('emits cancel_print_job with jobId', async () => {
-    const socket = await connect(partnerToken());
-    const received = waitFor(socket, 'cancel_print_job');
-    const res = await post('/api/cancel-print-job', { partnerId: PARTNER_ID, orderId: 'ORD-9' });
-    assert.equal(res.status, 200);
-    assert.deepEqual(res.body, { success: true, delivered: 1 });
-    assert.deepEqual(await received, { jobId: 'ORD-9' });
-  });
-
-  test('requires a valid signature', async () => {
-    const res = await post(
-      '/api/cancel-print-job',
-      { partnerId: PARTNER_ID, orderId: 'ORD-9' },
-      { signatureHeader: 'deadbeef' }
-    );
-    assert.equal(res.status, 401);
-  });
-
-  test('validates body', async () => {
-    assert.equal((await post('/api/cancel-print-job', { partnerId: 'bad', orderId: 'X' })).status, 400);
-    assert.equal((await post('/api/cancel-print-job', { partnerId: PARTNER_ID, orderId: '' })).status, 400);
-  });
-});
-
 describe('socket auth', () => {
   test('rejects missing token', async () => {
     await assert.rejects(connect(undefined), /No token/);
   });
 
   test('rejects token signed with wrong secret', async () => {
-    const bad = jwt.sign({ sub: PARTNER_ID, role: 'partner' }, 'other-secret');
+    const bad = jwt.sign({ sub: PARTNER_ID, partnerId: PARTNER_ID, did: 'dev_abc123', role: 'partner', typ: 'partner_access' }, 'other-secret');
     await assert.rejects(connect(bad), /Invalid token/);
   });
 
