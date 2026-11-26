@@ -251,6 +251,28 @@ function createServer({ dispatchSecret, partnerJwtSecret, allowedOrigins = [] } 
     }
   });
 
+  // New chat message for a partner: connected mobile/desktop apps update unread/chat view.
+  app.post('/api/notify-chat', signedJson, async (req, res, next) => {
+    try {
+      const { partnerId, conversationId, orderId, senderName, preview } = req.body;
+      if (!isNonEmptyString(partnerId) || !OBJECT_ID_RE.test(partnerId) || !isNonEmptyString(conversationId)) {
+        return res.status(400).json({ error: 'Invalid body' });
+      }
+      const room = `partner_${partnerId}`;
+      const sockets = await io.in(room).fetchSockets();
+      io.to(room).emit('chat:message', {
+        conversationId,
+        orderId: typeof orderId === 'string' ? orderId : undefined,
+        senderName: typeof senderName === 'string' ? senderName.slice(0, 80) : 'Customer',
+        preview: typeof preview === 'string' ? preview.slice(0, 140) : '',
+        at: Date.now(),
+      });
+      res.status(200).json({ success: true, delivered: sockets.length });
+    } catch (err) {
+      next(err);
+    }
+  });
+
   // A partner device was signed out: close its sockets now
   app.post('/api/disconnect-device', signedJson, async (req, res, next) => {
     try {

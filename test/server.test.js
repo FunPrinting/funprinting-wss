@@ -197,6 +197,35 @@ describe('POST /api/notify-jobs', () => {
   });
 });
 
+describe('POST /api/notify-chat', () => {
+  test('emits chat:message to the partner room with bounded fields', async () => {
+    const socket = await connect(partnerToken());
+    const received = waitFor(socket, 'chat:message');
+    const longPreview = 'x'.repeat(200);
+    const res = await post('/api/notify-chat', {
+      partnerId: PARTNER_ID,
+      conversationId: 'chat_123',
+      orderId: 'ORD99',
+      senderName: 'Asha',
+      preview: longPreview,
+    });
+    assert.equal(res.status, 200);
+    assert.deepEqual(res.body, { success: true, delivered: 1 });
+    const msg = await received;
+    assert.equal(msg.conversationId, 'chat_123');
+    assert.equal(msg.orderId, 'ORD99');
+    assert.equal(msg.senderName, 'Asha');
+    assert.equal(msg.preview.length, 140);
+    assert.equal(typeof msg.at, 'number');
+  });
+
+  test('validates partnerId, conversationId, and HMAC signature', async () => {
+    assert.equal((await post('/api/notify-chat', { partnerId: PARTNER_ID, conversationId: 'chat_1' }, { signatureHeader: 'bad' })).status, 401);
+    assert.equal((await post('/api/notify-chat', { partnerId: 'nope', conversationId: 'chat_1' })).status, 400);
+    assert.equal((await post('/api/notify-chat', { partnerId: PARTNER_ID, conversationId: '' })).status, 400);
+  });
+});
+
 describe('device sign-in tokens', () => {
   test('access token with the partner secret connects and joins the partner room', async () => {
     const socket = await connect(accessToken());
